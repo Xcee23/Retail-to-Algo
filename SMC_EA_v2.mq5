@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
-//|                           SMC_EA_v2.mq5 (v1.1 of your file)      |
+//|                           SMC_EA_v2_Fixed.mq5 (v1.2)            |
 //|             SMC Volatility-Adaptive EA (Smart Money Concepts)    |
 //|                     Copyright 2025, Jules the AI Engineer        |
 //|                                   (No external link)             |
 //+------------------------------------------------------------------+
 #property copyright   "Copyright 2025, Jules the AI Engineer"
 #property link        ""
-#property version     "1.10"
+#property version     "1.20"
 #property description "A volatility-adaptive trading system based on Smart Money Concepts."
 
 #include <Trade/Trade.mqh>
@@ -79,6 +79,9 @@ input bool          Use_Partial_TP             = true;      // Use TP1 and then 
 input int           Fib_Minor_BOS_Lookaround   = 5;         // Lookaround bars for Minor BOS
 input int           Fib_Lookback_Period        = 300;       // Bars to look back for major swings
 
+input group "Strategy Management"
+input bool          Allow_Both_Strategies      = false;     // Allow both Fib and SMC strategies simultaneously
+
 //=====================================================================
 // Globals
 //=====================================================================
@@ -91,6 +94,35 @@ int h_ATR_Entry;
 int h_TS_Atr; // For trailing stop
 
 CTrade trade; // trade object
+
+//=====================================================================
+// Structs (moved to top for proper declaration order)
+//=====================================================================
+struct TradeSignal { bool isValid; ENUM_ORDER_TYPE order_type; double entry_price; double sl_price; double tp_price; string comment; };
+struct BOS_Info { bool detected; int bar_index; };
+struct FVG_Info { bool detected; double top; double bottom; };
+struct OB_Info  { bool detected; double top; double bottom; };
+
+// Struct to hold swing points for Fibonacci
+struct FibSwings
+  {
+   bool     isValid;
+   datetime high_time;
+   double   high_price;
+   datetime low_time;
+   double   low_price;
+  };
+
+//=====================================================================
+// Market Regime Detection
+//=====================================================================
+enum ENUM_MARKET_REGIME { BULLISH_TREND, BEARISH_TREND, SIDEWAYS_RANGE };
+
+//=====================================================================
+// Function Declarations (moved to top)
+//=====================================================================
+FibSwings findRecentMajorSwings(const int start_bar, const int lookback_period);
+void DrawFibonacciLevels(string name, FibSwings swings);
 
 //=====================================================================
 // Utils / Guards
@@ -128,8 +160,6 @@ bool checkTimeFilters()
 //=====================================================================
 // Regime detection
 //=====================================================================
-enum ENUM_MARKET_REGIME { BULLISH_TREND, BEARISH_TREND, SIDEWAYS_RANGE };
-
 ENUM_MARKET_REGIME checkMarketRegime()
 {
    double sma_fast_buffer[], sma_medium_buffer[], sma_slow_buffer[], adx_buffer[];
@@ -161,6 +191,8 @@ ENUM_MARKET_REGIME checkMarketRegime()
 int findLastSwingHigh(const int start_bar, const int lookaround)
 {
    int total = Bars(_Symbol, _Period);
+   if(start_bar + lookaround >= total) return -1; // Safety check
+
    for(int i = start_bar + lookaround; i < total - lookaround; i++)
    {
       double ch = iHigh(_Symbol, _Period, i);
@@ -177,6 +209,8 @@ int findLastSwingHigh(const int start_bar, const int lookaround)
 int findLastSwingLow(const int start_bar, const int lookaround)
 {
    int total = Bars(_Symbol, _Period);
+   if(start_bar + lookaround >= total) return -1; // Safety check
+
    for(int i = start_bar + lookaround; i < total - lookaround; i++)
    {
       double cl = iLow(_Symbol, _Period, i);
@@ -193,10 +227,6 @@ int findLastSwingLow(const int start_bar, const int lookaround)
 //=====================================================================
 // SMC primitives (BOS / FVG / OB) & Confirmation Patterns
 //=====================================================================
-struct TradeSignal { bool isValid; ENUM_ORDER_TYPE order_type; double entry_price; double sl_price; double tp_price; };
-struct BOS_Info { bool detected; int bar_index; };
-struct FVG_Info { bool detected; double top; double bottom; };
-struct OB_Info  { bool detected; double top; double bottom; };
 
 // Refactored to accept lookaround parameter
 BOS_Info detectBOS(const int start_bar, const ENUM_MARKET_REGIME direction, const int lookaround)
@@ -250,6 +280,8 @@ BOS_Info detectMinorBOS(const int start_bar, const ENUM_MARKET_REGIME direction)
 
 bool isEngulfing(const int bar_idx, const ENUM_MARKET_REGIME direction)
 {
+   if(bar_idx < 1) return false; // Safety check
+
    double body_curr = MathAbs(iOpen(_Symbol, _Period, bar_idx) - iClose(_Symbol, _Period, bar_idx));
    double body_prev = MathAbs(iOpen(_Symbol, _Period, bar_idx + 1) - iClose(_Symbol, _Period, bar_idx + 1));
 
@@ -319,8 +351,11 @@ FVG_Info detectFVG(const int start_bar, const ENUM_MARKET_REGIME direction)
 OB_Info detectOrderBlock(const int bos_bar_index, const ENUM_MARKET_REGIME direction)
 {
    OB_Info res = {false, 0.0, 0.0};
+   int total_bars = Bars(_Symbol, _Period);
+   int search_limit = MathMin(50, total_bars - bos_bar_index - 1); // Safety check
+
    // Search the last opposite candle prior to the impulse that broke structure
-   for(int i = bos_bar_index + 1; i < bos_bar_index + 50; i++)
+   for(int i = bos_bar_index + 1; i < bos_bar_index + 1 + search_limit; i++)
    {
       double o = iOpen(_Symbol, _Period, i);
       double c = iClose(_Symbol, _Period, i);
@@ -344,7 +379,10 @@ OB_Info detectOrderBlock(const int bos_bar_index, const ENUM_MARKET_REGIME direc
 OB_Info findLastOrderBlock(const int start_bar, const int lookback, const ENUM_MARKET_REGIME direction)
 {
    OB_Info res = {false, 0, 0};
-   for(int i = start_bar; i < start_bar + lookback; i++)
+   int total_bars = Bars(_Symbol, _Period);
+   int search_limit = MathMin(lookback, total_bars - start_bar - 1); // Safety check
+
+   for(int i = start_bar; i < start_bar + search_limit; i++)
    {
       double o = iOpen(_Symbol, _Period, i);
       double c = iClose(_Symbol, _Period, i);
@@ -365,80 +403,15 @@ OB_Info findLastOrderBlock(const int start_bar, const int lookback, const ENUM_M
    return res;
 }
 
-//--- Main Logic for the new Fibonacci Strategy
-TradeSignal CheckFibonacciStrategy(const int start_bar)
-{
-    TradeSignal signal = {false};
-
-    // 1. Find major swings
-    FibSwings swings = findRecentMajorSwings(start_bar, Fib_Lookback_Period);
-    if(!swings.isValid) return signal;
-
-    // 2. Determine trend direction from swings
-    ENUM_MARKET_REGIME direction = (swings.high_time > swings.low_time) ? BEARISH_TREND : BULLISH_TREND;
-
-    // 3. Calculate Fib levels for the entry zone
-    double range = MathAbs(swings.high_price - swings.low_price);
-    double fib_zone_top = (direction == BEARISH_TREND) ? swings.low_price + range * (Fib_Level_2 / 100.0) : swings.high_price - range * (Fib_Level_1 / 100.0);
-    double fib_zone_bottom = (direction == BEARISH_TREND) ? swings.low_price + range * (Fib_Level_1 / 100.0) : swings.high_price - range * (Fib_Level_2 / 100.0);
-
-    // 4. Find an overlapping Order Block
-    OB_Info ob = findLastOrderBlock(start_bar, 100, direction); // Look back 100 bars for an OB
-    if(!ob.detected || ob.bottom > fib_zone_top || ob.top < fib_zone_bottom) return signal;
-
-    // 5. If we have a valid zone, draw it and check for entry
-    string fib_name = "SMC_EA_FIB_" + (string)swings.high_time;
-    DrawFibonacciLevels(fib_name, swings);
-
-    // 6. Check if price is in the zone
-    double current_high = iHigh(_Symbol, _Period, start_bar);
-    double current_low = iLow(_Symbol, _Period, start_bar);
-    bool in_zone = (direction == BEARISH_TREND && current_high >= fib_zone_bottom) || (direction == BULLISH_TREND && current_low <= fib_zone_top);
-    if(!in_zone) return signal;
-
-    // 7. Check for confirmation signal
-    bool confirmed = false;
-    switch(Confirmation_Type)
-    {
-        case CONF_ENGULFING: confirmed = isEngulfing(start_bar, direction); break;
-        case CONF_PIN_BAR: confirmed = isPinBar(start_bar, direction); break;
-        case CONF_MINOR_BOS: confirmed = detectMinorBOS(start_bar, direction).detected; break;
-    }
-    if(!confirmed) return signal;
-
-    // 8. If all conditions met, populate the trade signal
-    signal.isValid = true;
-    signal.order_type = (direction == BULLISH_TREND) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-    signal.entry_price = SymbolInfoDouble(_Symbol, (direction == BULLISH_TREND) ? SYMBOL_ASK : SYMBOL_BID);
-
-    if(SL_Method == SL_CONSERVATIVE)
-      signal.sl_price = (direction == BULLISH_TREND) ? swings.low_price : swings.high_price;
-    else // Aggressive
-      signal.sl_price = (direction == BULLISH_TREND) ? fib_zone_bottom : fib_zone_top;
-
-    signal.tp_price = (direction == BULLISH_TREND) ? swings.high_price : swings.low_price;
-
-    return signal;
-}
-//=====================================================================
-// Visuals
-//=====================================================================
-// Struct to hold swing points for Fibonacci
-struct FibSwings
-  {
-   bool     isValid;
-   datetime high_time;
-   double   high_price;
-   datetime low_time;
-   double   low_price;
-  };
-
-// --- Finds the most recent major swing high and low for Fibonacci
+//--- Finds the most recent major swing high and low for Fibonacci
 FibSwings findRecentMajorSwings(const int start_bar, const int lookback_period)
   {
    FibSwings res = {false};
-   int high_idx = iHighest(_Symbol, _Period, MODE_HIGH, lookback_period, start_bar);
-   int low_idx = iLowest(_Symbol, _Period, MODE_LOW, lookback_period, start_bar);
+   int total_bars = Bars(_Symbol, _Period);
+   int safe_lookback = MathMin(lookback_period, total_bars - start_bar - 1); // Safety check
+
+   int high_idx = iHighest(_Symbol, _Period, MODE_HIGH, safe_lookback, start_bar);
+   int low_idx = iLowest(_Symbol, _Period, MODE_LOW, safe_lookback, start_bar);
 
    if(high_idx != -1 && low_idx != -1 && high_idx != low_idx)
      {
@@ -450,6 +423,114 @@ FibSwings findRecentMajorSwings(const int start_bar, const int lookback_period)
      }
    return res;
   }
+
+//--- Main Logic for the new Fibonacci Strategy (FIXED)
+TradeSignal CheckFibonacciStrategy(const int start_bar)
+{
+    TradeSignal signal = {false};
+
+    // 1. Find major swings
+    FibSwings swings = findRecentMajorSwings(start_bar, Fib_Lookback_Period);
+    if(!swings.isValid) return signal;
+
+    // 2. Determine trend direction from swings
+    ENUM_MARKET_REGIME direction = (swings.high_time > swings.low_time) ? BEARISH_TREND : BULLISH_TREND;
+
+    // 3. Calculate Fib levels for the entry zone (FIXED LOGIC)
+    double range = MathAbs(swings.high_price - swings.low_price);
+    double fib_zone_top, fib_zone_bottom;
+
+    if(direction == BEARISH_TREND)
+    {
+        // For bearish, we're looking for retracement UP from the low
+        fib_zone_bottom = swings.low_price + range * (Fib_Level_1 / 100.0);
+        fib_zone_top = swings.low_price + range * (Fib_Level_2 / 100.0);
+    }
+    else
+    {
+        // For bullish, we're looking for retracement DOWN from the high
+        fib_zone_top = swings.high_price - range * (Fib_Level_1 / 100.0);
+        fib_zone_bottom = swings.high_price - range * (Fib_Level_2 / 100.0);
+    }
+
+    // Debug prints
+    if(Show_Visuals)
+    {
+        Print("Fib Strategy Debug - Direction: ", (direction == BULLISH_TREND ? "BULLISH" : "BEARISH"));
+        Print("High: ", swings.high_price, " at ", swings.high_time);
+        Print("Low: ", swings.low_price, " at ", swings.low_time);
+        Print("Entry Zone: ", fib_zone_bottom, " - ", fib_zone_top);
+    }
+
+    // 4. Find an overlapping Order Block
+    OB_Info ob = findLastOrderBlock(start_bar, 100, direction); // Look back 100 bars for an OB
+    if(!ob.detected)
+    {
+        if(Show_Visuals) Print("No Order Block found for Fib strategy");
+        return signal;
+    }
+
+    // Check if OB overlaps with fib zone
+    bool ob_overlaps = !(ob.bottom > fib_zone_top || ob.top < fib_zone_bottom);
+    if(!ob_overlaps)
+    {
+        if(Show_Visuals) Print("Order Block doesn't overlap with Fib zone");
+        return signal;
+    }
+
+    // 5. Draw Fibonacci levels and zone
+    string fib_name = "SMC_EA_FIB_" + (string)swings.high_time;
+    DrawFibonacciLevels(fib_name, swings);
+
+    // 6. Check if current price is in the zone
+    double current_high = iHigh(_Symbol, _Period, start_bar);
+    double current_low = iLow(_Symbol, _Period, start_bar);
+    bool in_zone = (current_high >= fib_zone_bottom && current_low <= fib_zone_top);
+
+    if(!in_zone)
+    {
+        if(Show_Visuals) Print("Price not in Fib zone. Current: ", current_low, "-", current_high);
+        return signal;
+    }
+
+    // 7. Check for confirmation signal
+    bool confirmed = false;
+    switch(Confirmation_Type)
+    {
+        case CONF_ENGULFING: confirmed = isEngulfing(start_bar, direction); break;
+        case CONF_PIN_BAR: confirmed = isPinBar(start_bar, direction); break;
+        case CONF_MINOR_BOS: confirmed = detectMinorBOS(start_bar, direction).detected; break;
+    }
+    if(!confirmed)
+    {
+        if(Show_Visuals) Print("No confirmation signal for Fib strategy");
+        return signal;
+    }
+
+    // 8. If all conditions met, populate the trade signal
+    signal.isValid = true;
+    signal.order_type = (direction == BULLISH_TREND) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    signal.entry_price = SymbolInfoDouble(_Symbol, (direction == BULLISH_TREND) ? SYMBOL_ASK : SYMBOL_BID);
+    signal.comment = "Fib Strategy";
+
+    if(SL_Method == SL_CONSERVATIVE)
+      signal.sl_price = (direction == BULLISH_TREND) ? swings.low_price : swings.high_price;
+    else // Aggressive
+      signal.sl_price = (direction == BULLISH_TREND) ? fib_zone_bottom : fib_zone_top;
+
+    // Calculate TP based on risk-reward ratio
+    double sl_distance = MathAbs(signal.entry_price - signal.sl_price);
+    if(direction == BULLISH_TREND)
+        signal.tp_price = signal.entry_price + sl_distance * Take_Profit_RR_Ratio;
+    else
+        signal.tp_price = signal.entry_price - sl_distance * Take_Profit_RR_Ratio;
+
+    return signal;
+}
+
+//=====================================================================
+// Visuals
+//=====================================================================
 
 // --- Draws Fibonacci levels on the chart
 void DrawFibonacciLevels(string name, FibSwings swings)
@@ -532,9 +613,11 @@ double NormalizeLots(double lots)
 
 double CalculateVolume(double entry_price, double sl_price, bool is_buy)
 {
-   if(sl_price == entry_price) return 0.0;
+   if(MathAbs(sl_price - entry_price) < _Point) return 0.0; // Safety check
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity <= 0) return 0.0; // Safety check
+
    double risk_amount = equity * (Risk_Per_Trade_Percent / 100.0);
 
    double loss_per_lot = 0.0;
@@ -547,14 +630,15 @@ double CalculateVolume(double entry_price, double sl_price, bool is_buy)
    if(loss_per_lot >= 0.0) return 0.0; // should be a loss for SL
 
    double lots = risk_amount / MathAbs(loss_per_lot);
+   if(lots <= 0) return 0.0; // Safety check
 
    // Margin sanity
    double px = is_buy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double margin = 0.0;
-   if(OrderCalcMargin(sim, _Symbol, lots, px, margin))
+   if(OrderCalcMargin(sim, _Symbol, lots, px, margin) && margin > 0)
    {
       double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
-      if(margin > free_margin && margin > 0.0) lots *= (free_margin / margin) * 0.95; // leave buffer
+      if(margin > free_margin) lots *= (free_margin / margin) * 0.95; // leave buffer
    }
 
    return NormalizeLots(lots);
@@ -576,50 +660,136 @@ bool HasOurPendingForSymbol()
    return false;
 }
 
+bool HasOurPendingForStrategy(string strategy_prefix)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; --i)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS)) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)Expert_Magic) continue;
+      string comment = OrderGetString(ORDER_COMMENT);
+      if(StringFind(comment, strategy_prefix) >= 0) return true;
+   }
+   return false;
+}
+
+//=====================================================================
+// Trade Execution
+//=====================================================================
+bool ExecuteTradeSignal(TradeSignal &signal)
+{
+   if(!signal.isValid) return false;
+
+   bool is_buy = (signal.order_type == ORDER_TYPE_BUY);
+   double volume = CalculateVolume(signal.entry_price, signal.sl_price, is_buy);
+   if(volume <= 0.0)
+   {
+      Print("Invalid volume calculated: ", volume);
+      return false;
+   }
+
+   // For partial TP, open two trades at half volume each
+   if(Use_Partial_TP && StringFind(signal.comment, "Fib") >= 0)
+   {
+      double half_volume = volume / 2.0;
+      half_volume = NormalizeLots(half_volume);
+      if(half_volume > 0)
+      {
+         // Trade 1: With TP1
+         bool trade1 = trade.TradeOpen(0, signal.order_type, half_volume, _Symbol,
+                                     signal.entry_price, signal.sl_price, signal.tp_price,
+                                     signal.comment + " TP1");
+         // Trade 2: No TP, managed by trailing stop
+         bool trade2 = trade.TradeOpen(0, signal.order_type, half_volume, _Symbol,
+                                     signal.entry_price, signal.sl_price, 0,
+                                     signal.comment + " Runner");
+         return (trade1 || trade2); // Success if at least one trade opened
+      }
+   }
+   else // Single trade with one TP
+   {
+      return trade.TradeOpen(0, signal.order_type, volume, _Symbol,
+                           signal.entry_price, signal.sl_price, signal.tp_price,
+                           signal.comment);
+   }
+
+   return false;
+}
+
 //=====================================================================
 // Lifecycle
 //=====================================================================
 int OnInit()
 {
    trade.SetExpertMagicNumber((long)Expert_Magic);
+   trade.SetTypeFilling(ORDER_FILLING_FOK); // Fill or Kill
+   trade.SetTypeExpiration(ORDER_TIME_SPECIFIED);
 
    // HTF indicators
    h_HTF_SmaFast   = iSMA(_Symbol, HTF_Timeframe, HTF_SmaFast_Period,   0, MODE_SMA, PRICE_CLOSE);
-   if(h_HTF_SmaFast == INVALID_HANDLE) { Print("Error creating HTF Fast SMA");   return INIT_FAILED; }
+   if(h_HTF_SmaFast == INVALID_HANDLE) { Print("Error creating HTF Fast SMA: ", GetLastError());   return INIT_FAILED; }
+
    h_HTF_SmaMedium = iSMA(_Symbol, HTF_Timeframe, HTF_SmaMedium_Period, 0, MODE_SMA, PRICE_CLOSE);
-   if(h_HTF_SmaMedium == INVALID_HANDLE) { Print("Error creating HTF Medium SMA"); return INIT_FAILED; }
+   if(h_HTF_SmaMedium == INVALID_HANDLE) { Print("Error creating HTF Medium SMA: ", GetLastError()); return INIT_FAILED; }
+
    h_HTF_SmaSlow   = iSMA(_Symbol, HTF_Timeframe, HTF_SmaSlow_Period,   0, MODE_SMA, PRICE_CLOSE);
-   if(h_HTF_SmaSlow == INVALID_HANDLE) { Print("Error creating HTF Slow SMA");   return INIT_FAILED; }
+   if(h_HTF_SmaSlow == INVALID_HANDLE) { Print("Error creating HTF Slow SMA: ", GetLastError());   return INIT_FAILED; }
+
    h_HTF_Adx       = iADX(_Symbol, HTF_Timeframe, ADX_Period);
-   if(h_HTF_Adx == INVALID_HANDLE)     { Print("Error creating HTF ADX");        return INIT_FAILED; }
+   if(h_HTF_Adx == INVALID_HANDLE)     { Print("Error creating HTF ADX: ", GetLastError());        return INIT_FAILED; }
 
    // Current TF indicators
    h_ATR_Entry = iATR(_Symbol, _Period, ATR_Period_Entry);
-   if(h_ATR_Entry == INVALID_HANDLE)   { Print("Error creating Entry ATR");      return INIT_FAILED; }
+   if(h_ATR_Entry == INVALID_HANDLE)   { Print("Error creating Entry ATR: ", GetLastError());      return INIT_FAILED; }
 
    if(Use_Trailing_Stop)
    {
       h_TS_Atr = iATR(_Symbol, _Period, TS_ATR_Period);
-      if(h_TS_Atr == INVALID_HANDLE) { Print("Error creating Trailing ATR");     return INIT_FAILED; }
+      if(h_TS_Atr == INVALID_HANDLE) { Print("Error creating Trailing ATR: ", GetLastError());     return INIT_FAILED; }
    }
 
-   Print("SMC Volatility Adaptive EA v1.1 initialized successfully.");
+   // Validate input parameters
+   if(Risk_Per_Trade_Percent <= 0 || Risk_Per_Trade_Percent > 10)
+   {
+      Print("Warning: Risk_Per_Trade_Percent should be between 0.1 and 10.0");
+   }
+
+   if(Fib_Level_1 >= Fib_Level_2)
+   {
+      Print("Warning: Fib_Level_1 should be less than Fib_Level_2");
+   }
+
+   Print("SMC Volatility Adaptive EA v1.2 initialized successfully.");
+   Print("EnableFibStrategy: ", EnableFibStrategy ? "YES" : "NO");
+   Print("Allow_Both_Strategies: ", Allow_Both_Strategies ? "YES" : "NO");
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   // Optional: clean objects or detach indicators; left as-is to keep visuals
+   // Release indicator handles
+   if(h_HTF_SmaFast != INVALID_HANDLE) IndicatorRelease(h_HTF_SmaFast);
+   if(h_HTF_SmaMedium != INVALID_HANDLE) IndicatorRelease(h_HTF_SmaMedium);
+   if(h_HTF_SmaSlow != INVALID_HANDLE) IndicatorRelease(h_HTF_SmaSlow);
+   if(h_HTF_Adx != INVALID_HANDLE) IndicatorRelease(h_HTF_Adx);
+   if(h_ATR_Entry != INVALID_HANDLE) IndicatorRelease(h_ATR_Entry);
+   if(h_TS_Atr != INVALID_HANDLE) IndicatorRelease(h_TS_Atr);
+
+   Print("SMC EA deinitialized. Reason: ", reason);
 }
 
 //=====================================================================
-// OnTick
+// OnTick - Main Logic
 //=====================================================================
 void OnTick()
 {
    if(!isNewBar()) return;
    CleanupChartObjects(300);
-   if(!SpreadOkay()) return;
+   if(!SpreadOkay())
+   {
+      if(Show_Visuals) Print("Spread too wide: ", SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+      return;
+   }
 
    // --- POSITION MANAGEMENT ---
    if(PositionSelect(_Symbol))
@@ -628,26 +798,37 @@ void OnTick()
       if(Use_Trailing_Stop)
       {
          double atr_buffer[];
-         if(CopyBuffer(h_TS_Atr, 0, 0, 2, atr_buffer) > 0)
+         ArraySetAsSeries(atr_buffer, true);
+         if(CopyBuffer(h_TS_Atr, 0, 0, 2, atr_buffer) > 1)
          {
             double dist = atr_buffer[1] * TS_ATR_Multiplier;
             double curr_sl = PositionGetDouble(POSITION_SL);
             double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
             double new_sl = 0.0;
             long ptype = PositionGetInteger(POSITION_TYPE);
+
             if(ptype == POSITION_TYPE_BUY)
             {
                new_sl = SymbolInfoDouble(_Symbol, SYMBOL_BID) - dist;
-               if((new_sl > curr_sl) && (new_sl > pos_open)) trade.PositionModify(_Symbol, new_sl, PositionGetDouble(POSITION_TP));
+               if((new_sl > curr_sl || curr_sl == 0) && (new_sl > pos_open))
+               {
+                  if(trade.PositionModify(_Symbol, new_sl, PositionGetDouble(POSITION_TP)))
+                     Print("Trailing stop updated for BUY: ", new_sl);
+               }
             }
             else if(ptype == POSITION_TYPE_SELL)
             {
                new_sl = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + dist;
-               if((new_sl < curr_sl) && (new_sl < pos_open)) trade.PositionModify(_Symbol, new_sl, PositionGetDouble(POSITION_TP));
+               if((new_sl < curr_sl || curr_sl == 0) && (new_sl < pos_open))
+               {
+                  if(trade.PositionModify(_Symbol, new_sl, PositionGetDouble(POSITION_TP)))
+                     Print("Trailing stop updated for SELL: ", new_sl);
+               }
             }
          }
       }
-      return; // In a trade, so don't scan for new setups
+
+      if(!Allow_Both_Strategies) return; // In a trade, don't scan for new setups unless allowed
    }
 
    // --- PENDING ORDER MANAGEMENT ---
@@ -661,91 +842,129 @@ void OnTick()
          // Expire old pending orders
          if((TimeCurrent() - (datetime)OrderGetInteger(ORDER_TIME_SETUP)) > (Pending_Order_Expiry_Bars * PeriodSeconds()))
          {
-            trade.OrderDelete((ulong)OrderGetInteger(ORDER_TICKET));
+            ulong ticket = (ulong)OrderGetInteger(ORDER_TICKET);
+            if(trade.OrderDelete(ticket))
+               Print("Expired pending order deleted: ", ticket);
          }
-         // If we have any live pending order for this symbol, don't create new ones
-         return;
       }
+
+      if(!Allow_Both_Strategies && HasOurPendingForSymbol()) return; // Don't create new orders if we have pending ones
    }
 
    // --- NEW SETUP SCANNING ---
-   if(!checkTimeFilters()) return;
+   if(!checkTimeFilters())
+   {
+      if(Show_Visuals) Print("Outside trading session");
+      return;
+   }
+
+   bool fib_trade_taken = false;
+   bool smc_trade_taken = false;
 
    // --- STRATEGY 1: Fibonacci Retracement Strategy ---
-   if(EnableFibStrategy)
+   if(EnableFibStrategy && (!HasOurPendingForStrategy("Fib") || Allow_Both_Strategies))
    {
       TradeSignal fib_signal = CheckFibonacciStrategy(1);
       if(fib_signal.isValid)
       {
-         bool is_buy = (fib_signal.order_type == ORDER_TYPE_BUY);
-         // For partial TP, open two trades at half volume each
-         if(Use_Partial_TP)
+         if(ExecuteTradeSignal(fib_signal))
          {
-            double volume = CalculateVolume(fib_signal.entry_price, fib_signal.sl_price, is_buy) / 2.0;
-            if(volume > 0)
-            {
-               // Trade 1: With TP1
-               trade.TradeOpen(0, fib_signal.order_type, volume, _Symbol, fib_signal.entry_price, fib_signal.sl_price, fib_signal.tp_price, "Fib TP1");
-               // Trade 2: No TP, managed by trailing stop
-               trade.TradeOpen(0, fib_signal.order_type, volume, _Symbol, fib_signal.entry_price, fib_signal.sl_price, 0, "Fib Runner");
-            }
+            Print("Fibonacci strategy trade executed successfully");
+            fib_trade_taken = true;
          }
-         else // Single trade with one TP
+         else
          {
-            double volume = CalculateVolume(fib_signal.entry_price, fib_signal.sl_price, is_buy);
-            if(volume > 0)
-            {
-               trade.TradeOpen(0, fib_signal.order_type, volume, _Symbol, fib_signal.entry_price, fib_signal.sl_price, fib_signal.tp_price, "Fib Full TP");
-            }
+            Print("Failed to execute Fibonacci strategy trade");
          }
-         return; // Stop scanning if a Fib trade was placed
       }
    }
 
    // --- STRATEGY 2: Original SMC (BOS) Strategy ---
-   ENUM_MARKET_REGIME regime = checkMarketRegime();
-   if(regime == SIDEWAYS_RANGE) return;
-
-   BOS_Info bos = detectBOS(1, regime);
-   if(!bos.detected) return;
-
-   OB_Info ob = detectOrderBlock(bos.bar_index, regime);
-   FVG_Info fvg = detectFVG(bos.bar_index, regime);
-   if(!(ob.detected || fvg.detected)) return;
-
-   double entry_price=0.0, sl=0.0, tp=0.0;
-   bool is_buy = (regime == BULLISH_TREND);
-
-   if(ob.detected)
+   // Only run if we allow both strategies OR if Fib strategy didn't trigger
+   if((!fib_trade_taken || Allow_Both_Strategies) && (!HasOurPendingForStrategy("SMC") || Allow_Both_Strategies))
    {
-      entry_price = is_buy ? ob.top : ob.bottom;
-      sl = is_buy ? ob.bottom : ob.top;
-      DrawRectangle(StringFormat("SMC_EA_OB_%d", bos.bar_index), iTime(_Symbol, _Period, bos.bar_index), ob.top, iTime(_Symbol, _Period, 0), ob.bottom, is_buy ? Bullish_Zone_Color : Bearish_Zone_Color, "OB");
-   }
-   else
-   {
-      entry_price = is_buy ? fvg.top : fvg.bottom;
-      sl = is_buy ? fvg.bottom : fvg.top;
-      DrawRectangle(StringFormat("SMC_EA_FVG_%d", bos.bar_index), iTime(_Symbol, _Period, bos.bar_index), fvg.top, iTime(_Symbol, _Period, bos.bar_index-2), fvg.bottom, is_buy ? Bullish_Zone_Color : Bearish_Zone_Color, "FVG");
-   }
+      ENUM_MARKET_REGIME regime = checkMarketRegime();
+      if(regime == SIDEWAYS_RANGE)
+      {
+         if(Show_Visuals) Print("Market in sideways range - no SMC trades");
+         return;
+      }
 
-   tp = is_buy ? entry_price + (entry_price - sl) * Take_Profit_RR_Ratio : entry_price - (sl - entry_price) * Take_Profit_RR_Ratio;
-   double volume = CalculateVolume(entry_price, sl, is_buy);
-   if(volume <= 0.0) return;
+      BOS_Info bos = detectBOS(1, regime, Swing_Lookaround_Bars);
+      if(!bos.detected)
+      {
+         if(Show_Visuals) Print("No BOS detected for SMC strategy");
+         return;
+      }
 
-   // Place pending order
-   datetime expiry_time = TimeCurrent() + (Pending_Order_Expiry_Bars * PeriodSeconds());
-   if(is_buy)
-      trade.BuyLimit(volume, entry_price, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiry_time, "SMC EA Buy Limit");
-   else
-      trade.SellLimit(volume, entry_price, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiry_time, "SMC EA Sell Limit");
+      OB_Info ob = detectOrderBlock(bos.bar_index, regime);
+      FVG_Info fvg = detectFVG(bos.bar_index, regime);
+      if(!(ob.detected || fvg.detected))
+      {
+         if(Show_Visuals) Print("No OB or FVG detected for SMC strategy");
+         return;
+      }
 
-   // Draw BOS line
-   int swing_bar_idx = is_buy ? findLastSwingHigh(bos.bar_index + 1, Swing_Lookaround_Bars) : findLastSwingLow(bos.bar_index + 1, Swing_Lookaround_Bars);
-   if(swing_bar_idx != -1)
-   {
-      double swing_price = is_buy ? iHigh(_Symbol, _Period, swing_bar_idx) : iLow(_Symbol, _Period, swing_bar_idx);
-      DrawLine(StringFormat("SMC_EA_BOS_%d", bos.bar_index), iTime(_Symbol, _Period, swing_bar_idx), swing_price, iTime(_Symbol, _Period, bos.bar_index), swing_price, BOS_Line_Color);
+      double entry_price=0.0, sl=0.0, tp=0.0;
+      bool is_buy = (regime == BULLISH_TREND);
+
+      if(ob.detected)
+      {
+         entry_price = is_buy ? ob.top : ob.bottom;
+         sl = is_buy ? ob.bottom : ob.top;
+         DrawRectangle(StringFormat("SMC_EA_OB_%d", bos.bar_index),
+                      iTime(_Symbol, _Period, bos.bar_index), ob.top,
+                      iTime(_Symbol, _Period, 0), ob.bottom,
+                      is_buy ? Bullish_Zone_Color : Bearish_Zone_Color, "OB");
+      }
+      else
+      {
+         entry_price = is_buy ? fvg.top : fvg.bottom;
+         sl = is_buy ? fvg.bottom : fvg.top;
+         DrawRectangle(StringFormat("SMC_EA_FVG_%d", bos.bar_index),
+                      iTime(_Symbol, _Period, bos.bar_index), fvg.top,
+                      iTime(_Symbol, _Period, bos.bar_index-2), fvg.bottom,
+                      is_buy ? Bullish_Zone_Color : Bearish_Zone_Color, "FVG");
+      }
+
+      tp = is_buy ? entry_price + (entry_price - sl) * Take_Profit_RR_Ratio : entry_price - (sl - entry_price) * Take_Profit_RR_Ratio;
+      double volume = CalculateVolume(entry_price, sl, is_buy);
+      if(volume <= 0.0)
+      {
+         Print("Invalid volume for SMC strategy: ", volume);
+         return;
+      }
+
+      // Place pending order
+      datetime expiry_time = TimeCurrent() + (Pending_Order_Expiry_Bars * PeriodSeconds());
+      bool order_result = false;
+
+      if(is_buy)
+         order_result = trade.BuyLimit(volume, entry_price, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiry_time, "SMC EA Buy Limit");
+      else
+         order_result = trade.SellLimit(volume, entry_price, _Symbol, sl, tp, ORDER_TIME_SPECIFIED, expiry_time, "SMC EA Sell Limit");
+
+      if(order_result)
+      {
+         Print("SMC strategy pending order placed successfully");
+         smc_trade_taken = true;
+
+         // Draw BOS line
+         int swing_bar_idx = is_buy ? findLastSwingHigh(bos.bar_index + 1, Swing_Lookaround_Bars) :
+                                    findLastSwingLow(bos.bar_index + 1, Swing_Lookaround_Bars);
+         if(swing_bar_idx != -1)
+         {
+            double swing_price = is_buy ? iHigh(_Symbol, _Period, swing_bar_idx) :
+                                        iLow(_Symbol, _Period, swing_bar_idx);
+            DrawLine(StringFormat("SMC_EA_BOS_%d", bos.bar_index),
+                    iTime(_Symbol, _Period, swing_bar_idx), swing_price,
+                    iTime(_Symbol, _Period, bos.bar_index), swing_price, BOS_Line_Color);
+         }
+      }
+      else
+      {
+         Print("Failed to place SMC strategy pending order. Error: ", trade.ResultRetcode());
+      }
    }
 }
 
